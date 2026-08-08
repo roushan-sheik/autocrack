@@ -1,0 +1,8 @@
+
+BSSID, First time seen, Last time seen, channel, Speed, Privacy, Cipher, Authentication, Power, # beacons, # IV, LAN IP, ID-length, ESSID, Key
+98:25:4A:CA:FA:04, 2026-08-08 20:32:44, 2026-08-08 20:32:49,  2, 270, WPA2, CCMP, PSK, -69,       11,       51,   0.  0.  0.  0,  11, Wifi House , 
+
+Station MAC, First time seen, Last time seen, Power, # packets, BSSID, Probed ESSIDs
+C2:C1:1A:0A:C0:3E, 2026-08-08 20:32:44, 2026-08-08 20:32:47, -65,       26, 98:25:4A:CA:FA:04,Wifi House 
+88:28:7D:01:CF:40, 2026-08-08 20:32:47, 2026-08-08 20:32:47, -65,       32, 98:25:4A:CA:FA:04,
+
